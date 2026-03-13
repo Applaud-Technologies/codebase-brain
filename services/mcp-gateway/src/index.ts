@@ -612,6 +612,464 @@ async function getArchitectureContext(params: { file_path?: string; namespace?: 
 }
 
 // =============================================================================
+// REPOSITORY INDEXING
+// =============================================================================
+
+import * as fs from "fs";
+import * as path from "path";
+
+interface IndexedSymbol {
+  id: string;
+  name: string;
+  qualified_name: string;
+  symbol_type: string;
+  file_path: string;
+  line_start: number;
+  line_end: number;
+  signature: string;
+  namespace: string;
+  language: string;
+  description: string;
+}
+
+interface IndexProgress {
+  status: "running" | "completed" | "failed";
+  files_found: number;
+  files_processed: number;
+  symbols_indexed: number;
+  current_file?: string;
+  errors: string[];
+  started_at: string;
+  completed_at?: string;
+}
+
+// Store active indexing jobs
+const indexingJobs = new Map<string, IndexProgress>();
+
+async function indexRepo(params: {
+  repo_path: string;
+  language?: string;
+  incremental?: boolean;
+  collection_name?: string;
+}): Promise<{ job_id: string; status: string; message: string }> {
+  const jobId = randomUUID();
+  const repoPath = params.repo_path;
+  const language = params.language || "csharp";
+  const collectionName = params.collection_name || "code_chunks";
+
+  // Validate repo path exists
+  if (!fs.existsSync(repoPath)) {
+    return { job_id: jobId, status: "failed", message: `Path not found: ${repoPath}` };
+  }
+
+  // Initialize progress
+  const progress: IndexProgress = {
+    status: "running",
+    files_found: 0,
+    files_processed: 0,
+    symbols_indexed: 0,
+    errors: [],
+    started_at: new Date().toISOString(),
+  };
+  indexingJobs.set(jobId, progress);
+
+  // Run indexing in background
+  indexRepoAsync(jobId, repoPath, language, collectionName, progress).catch((err) => {
+    progress.status = "failed";
+    progress.errors.push(err.message);
+    progress.completed_at = new Date().toISOString();
+  });
+
+  return {
+    job_id: jobId,
+    status: "started",
+    message: `Indexing started for ${repoPath}. Use get_index_status to check progress.`,
+  };
+}
+
+async function indexRepoAsync(
+  jobId: string,
+  repoPath: string,
+  language: string,
+  collectionName: string,
+  progress: IndexProgress
+): Promise<void> {
+  const startTime = Date.now();
+  logger.info({ jobId, repoPath, language }, "Starting repository indexing");
+
+  try {
+    // Ensure Qdrant collection exists
+    await ensureQdrantCollection(collectionName);
+
+    // Find all source files
+    const extensions = getExtensionsForLanguage(language);
+    const files = findSourceFiles(repoPath, extensions);
+    progress.files_found = files.length;
+    logger.info({ jobId, fileCount: files.length }, "Found source files");
+
+    // Check for solution file (C# specific)
+    const solutionFile = findSolutionFile(repoPath);
+    let symbols: IndexedSymbol[] = [];
+
+    if (solutionFile && language === "csharp") {
+      // Use Roslyn worker for full analysis
+      logger.info({ jobId, solutionFile }, "Using Roslyn worker for analysis");
+      try {
+        symbols = await analyzeWithRoslyn(solutionFile, repoPath, progress);
+      } catch (err) {
+        logger.warn({ jobId, error: (err as Error).message }, "Roslyn analysis failed, falling back to regex");
+        symbols = await parseFilesWithRegex(files, language, repoPath, progress);
+      }
+    } else {
+      // Use regex-based parsing for standalone files
+      symbols = await parseFilesWithRegex(files, language, repoPath, progress);
+    }
+
+    logger.info({ jobId, symbolCount: symbols.length }, "Extracted symbols");
+
+    // Generate embeddings and store in Qdrant
+    let indexed = 0;
+    const batchSize = 10;
+
+    for (let i = 0; i < symbols.length; i += batchSize) {
+      const batch = symbols.slice(i, i + batchSize);
+
+      // Generate embeddings for batch
+      const embeddings = await Promise.all(
+        batch.map((s) => embeddingService.embed(s.description))
+      );
+
+      // Prepare points for Qdrant
+      const points = batch.map((symbol, idx) => ({
+        id: hashString(symbol.id),
+        vector: embeddings[idx],
+        payload: {
+          symbol_id: symbol.id,
+          name: symbol.name,
+          qualified_name: symbol.qualified_name,
+          symbol_type: symbol.symbol_type,
+          file_path: symbol.file_path,
+          line_start: symbol.line_start,
+          line_end: symbol.line_end,
+          signature: symbol.signature,
+          namespace: symbol.namespace,
+          language: symbol.language,
+          usage_count: 0,
+        },
+      }));
+
+      // Upsert to Qdrant
+      await qdrant.upsert(collectionName, { points });
+
+      // Store in Neo4j
+      await storeSymbolsInNeo4j(batch);
+
+      indexed += batch.length;
+      progress.symbols_indexed = indexed;
+      logger.debug({ jobId, indexed, total: symbols.length }, "Indexing progress");
+    }
+
+    progress.status = "completed";
+    progress.completed_at = new Date().toISOString();
+
+    const duration = Date.now() - startTime;
+    logger.info(
+      { jobId, symbols: symbols.length, duration, filesProcessed: progress.files_processed },
+      "Repository indexing completed"
+    );
+  } catch (err) {
+    progress.status = "failed";
+    progress.errors.push((err as Error).message);
+    progress.completed_at = new Date().toISOString();
+    logger.error({ jobId, error: (err as Error).message }, "Repository indexing failed");
+    throw err;
+  }
+}
+
+async function ensureQdrantCollection(collectionName: string): Promise<void> {
+  try {
+    await qdrant.getCollection(collectionName);
+  } catch {
+    // Collection doesn't exist, create it
+    await qdrant.createCollection(collectionName, {
+      vectors: {
+        size: config.embeddingDimensions,
+        distance: "Cosine",
+      },
+    });
+    logger.info({ collectionName }, "Created Qdrant collection");
+  }
+}
+
+function getExtensionsForLanguage(language: string): string[] {
+  const extensionMap: Record<string, string[]> = {
+    csharp: [".cs"],
+    typescript: [".ts", ".tsx"],
+    javascript: [".js", ".jsx"],
+    python: [".py"],
+  };
+  return extensionMap[language] || [".cs"];
+}
+
+function findSourceFiles(dir: string, extensions: string[]): string[] {
+  const files: string[] = [];
+
+  function walk(currentDir: string) {
+    const entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+
+      // Skip common non-source directories
+      if (entry.isDirectory()) {
+        if (["node_modules", "bin", "obj", ".git", ".vs", "packages"].includes(entry.name)) {
+          continue;
+        }
+        walk(fullPath);
+      } else if (entry.isFile()) {
+        if (extensions.some((ext) => entry.name.endsWith(ext))) {
+          files.push(fullPath);
+        }
+      }
+    }
+  }
+
+  walk(dir);
+  return files;
+}
+
+function findSolutionFile(dir: string): string | null {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isFile() && entry.name.endsWith(".sln")) {
+      return path.join(dir, entry.name);
+    }
+  }
+  return null;
+}
+
+async function analyzeWithRoslyn(
+  solutionPath: string,
+  repoPath: string,
+  progress: IndexProgress
+): Promise<IndexedSymbol[]> {
+  const response = await fetch(`${config.roslynUrl}/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ SolutionPath: solutionPath }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Roslyn analysis failed: ${response.statusText}`);
+  }
+
+  const result = await response.json() as {
+    Symbols: Array<{
+      Name: string;
+      QualifiedName: string;
+      Kind: string;
+      FilePath: string;
+      LineStart: number;
+      LineEnd: number;
+      Signature: string;
+      Namespace: string;
+    }>;
+  };
+
+  progress.files_processed = progress.files_found;
+
+  return result.Symbols.map((s) => ({
+    id: `${repoPath}:${s.QualifiedName}`,
+    name: s.Name,
+    qualified_name: s.QualifiedName,
+    symbol_type: s.Kind.toLowerCase(),
+    file_path: s.FilePath,
+    line_start: s.LineStart,
+    line_end: s.LineEnd,
+    signature: s.Signature || s.Name,
+    namespace: s.Namespace || "",
+    language: "csharp",
+    description: generateDescription(s.Name, s.Kind, s.Signature, s.Namespace),
+  }));
+}
+
+async function parseFilesWithRegex(
+  files: string[],
+  language: string,
+  repoPath: string,
+  progress: IndexProgress
+): Promise<IndexedSymbol[]> {
+  const symbols: IndexedSymbol[] = [];
+
+  for (const filePath of files) {
+    try {
+      progress.current_file = filePath;
+      const content = fs.readFileSync(filePath, "utf-8");
+      const relativePath = path.relative(repoPath, filePath);
+      const fileSymbols = parseFileContent(content, relativePath, language, repoPath);
+      symbols.push(...fileSymbols);
+      progress.files_processed++;
+    } catch (err) {
+      progress.errors.push(`Failed to parse ${filePath}: ${(err as Error).message}`);
+    }
+  }
+
+  return symbols;
+}
+
+function parseFileContent(
+  content: string,
+  relativePath: string,
+  language: string,
+  repoPath: string
+): IndexedSymbol[] {
+  const symbols: IndexedSymbol[] = [];
+
+  // Extract namespace
+  let currentNamespace = "";
+  const namespaceMatch = content.match(/namespace\s+([\w.]+)/);
+  if (namespaceMatch) {
+    currentNamespace = namespaceMatch[1];
+  }
+
+  // Regex patterns for C#
+  const classPattern = /(?:public|private|internal|protected)?\s*(?:static|abstract|sealed|partial)?\s*class\s+(\w+)/g;
+  const interfacePattern = /(?:public|private|internal|protected)?\s*interface\s+(I\w+)/g;
+  const methodPattern = /(?:public|private|internal|protected)\s+(?:static\s+)?(?:async\s+)?(?:virtual\s+)?(?:override\s+)?(?:[\w<>\[\],\s]+)\s+(\w+)\s*\([^)]*\)/g;
+
+  // Find classes
+  let match;
+  while ((match = classPattern.exec(content)) !== null) {
+    const lineNumber = content.substring(0, match.index).split("\n").length;
+    const name = match[1];
+    symbols.push({
+      id: `${repoPath}:${currentNamespace}.${name}`,
+      name,
+      qualified_name: `${currentNamespace}.${name}`,
+      symbol_type: "class",
+      file_path: relativePath,
+      line_start: lineNumber,
+      line_end: lineNumber,
+      signature: match[0].trim(),
+      namespace: currentNamespace,
+      language,
+      description: generateDescription(name, "class", match[0].trim(), currentNamespace),
+    });
+  }
+
+  // Find interfaces
+  while ((match = interfacePattern.exec(content)) !== null) {
+    const lineNumber = content.substring(0, match.index).split("\n").length;
+    const name = match[1];
+    symbols.push({
+      id: `${repoPath}:${currentNamespace}.${name}`,
+      name,
+      qualified_name: `${currentNamespace}.${name}`,
+      symbol_type: "interface",
+      file_path: relativePath,
+      line_start: lineNumber,
+      line_end: lineNumber,
+      signature: match[0].trim(),
+      namespace: currentNamespace,
+      language,
+      description: generateDescription(name, "interface", match[0].trim(), currentNamespace),
+    });
+  }
+
+  // Find methods
+  while ((match = methodPattern.exec(content)) !== null) {
+    const lineNumber = content.substring(0, match.index).split("\n").length;
+    const name = match[1];
+    // Skip constructors and common false positives
+    if (["if", "for", "while", "switch", "catch", "using", "lock", "return"].includes(name)) {
+      continue;
+    }
+    symbols.push({
+      id: `${repoPath}:${currentNamespace}.${name}`,
+      name,
+      qualified_name: `${currentNamespace}.${name}`,
+      symbol_type: "method",
+      file_path: relativePath,
+      line_start: lineNumber,
+      line_end: lineNumber,
+      signature: match[0].trim(),
+      namespace: currentNamespace,
+      language,
+      description: generateDescription(name, "method", match[0].trim(), currentNamespace),
+    });
+  }
+
+  return symbols;
+}
+
+function generateDescription(name: string, kind: string, signature: string, namespace: string): string {
+  // Convert PascalCase to readable text
+  const readable = name.replace(/([A-Z])/g, " $1").trim().toLowerCase();
+
+  // Generate a natural language description
+  switch (kind.toLowerCase()) {
+    case "class":
+      return `${readable} class in ${namespace}. ${signature}`;
+    case "interface":
+      return `${readable} interface defining contract in ${namespace}`;
+    case "method":
+      return `${readable} method. ${signature}`;
+    default:
+      return `${kind} ${readable} in ${namespace}`;
+  }
+}
+
+async function storeSymbolsInNeo4j(symbols: IndexedSymbol[]): Promise<void> {
+  const session = neo4jDriver.session();
+  try {
+    for (const symbol of symbols) {
+      await session.run(
+        `MERGE (s:Symbol {id: $id})
+         SET s.name = $name,
+             s.qualified_name = $qualified_name,
+             s.symbol_type = $symbol_type,
+             s.file_path = $file_path,
+             s.line_start = $line_start,
+             s.namespace = $namespace,
+             s.language = $language,
+             s.signature = $signature
+         MERGE (f:File {path: $file_path})
+         MERGE (s)-[:DEFINED_IN]->(f)
+         WITH s
+         MERGE (n:Namespace {name: $namespace})
+         MERGE (s)-[:IN_NAMESPACE]->(n)`,
+        {
+          id: symbol.id,
+          name: symbol.name,
+          qualified_name: symbol.qualified_name,
+          symbol_type: symbol.symbol_type,
+          file_path: symbol.file_path,
+          line_start: symbol.line_start,
+          namespace: symbol.namespace,
+          language: symbol.language,
+          signature: symbol.signature,
+        }
+      );
+    }
+  } finally {
+    await session.close();
+  }
+}
+
+function hashString(str: string): number {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32-bit integer
+  }
+  return Math.abs(hash);
+}
+
+function getIndexStatus(jobId: string): IndexProgress | null {
+  return indexingJobs.get(jobId) || null;
+}
+
+// =============================================================================
 // MCP SERVER
 // =============================================================================
 
@@ -853,6 +1311,25 @@ app.post("/api/tools/get_architecture_context", async (req: Request, res: Respon
   }
 });
 
+// Indexing endpoints
+app.post("/api/index", async (req: Request, res: Response) => {
+  try {
+    const result = await indexRepo(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+app.get("/api/index/:jobId", async (req: Request, res: Response) => {
+  const status = getIndexStatus(req.params.jobId);
+  if (status) {
+    res.json(status);
+  } else {
+    res.status(404).json({ error: "Job not found" });
+  }
+});
+
 // =============================================================================
 // STREAMABLE HTTP TRANSPORT FOR MCP
 // =============================================================================
@@ -925,6 +1402,31 @@ function createMcpServer(): Server {
             required: ["proposed_change", "search_evidence", "justification"],
           },
         },
+        {
+          name: "index_repo",
+          description: "Index a repository for semantic search and duplicate detection. Run this to ingest code into Codebase Brain.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              repo_path: { type: "string", description: "Absolute path to the repository root" },
+              language: { type: "string", enum: ["csharp", "typescript", "javascript", "python"], default: "csharp" },
+              incremental: { type: "boolean", default: false, description: "Only index changed files" },
+              collection_name: { type: "string", default: "code_chunks", description: "Qdrant collection name" },
+            },
+            required: ["repo_path"],
+          },
+        },
+        {
+          name: "get_index_status",
+          description: "Check the status of an indexing job.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              job_id: { type: "string", description: "The job ID returned by index_repo" },
+            },
+            required: ["job_id"],
+          },
+        },
       ],
     };
   });
@@ -945,6 +1447,13 @@ function createMcpServer(): Server {
           break;
         case "pre_write_guard":
           result = await preWriteGuard(args as Parameters<typeof preWriteGuard>[0]);
+          break;
+        case "index_repo":
+          result = await indexRepo(args as Parameters<typeof indexRepo>[0]);
+          break;
+        case "get_index_status":
+          const status = getIndexStatus((args as { job_id: string }).job_id);
+          result = status || { error: "Job not found" };
           break;
         default:
           throw new Error(`Unknown tool: ${name}`);
