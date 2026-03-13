@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Qdrant vector collection schemas for Codebase Brain",
+  "collections": {
+    "code_chunks": {
+      "description": "Semantic embeddings of code chunks (methods, classes, functions)",
+      "vector_config": {
+        "size": "${EMBEDDING_DIMENSIONS:-384}",
+        "distance": "Cosine",
+        "on_disk": true,
+        "note": "Size must match your embedding model: all-minilm=384, nomic=768, mxbai=1024"
+      },
+      "payload_schema": {
+        "symbol_id": { "type": "keyword", "indexed": true },
+        "symbol_type": { "type": "keyword", "indexed": true },
+        "name": { "type": "keyword", "indexed": true },
+        "qualified_name": { "type": "keyword", "indexed": true },
+        "file_path": { "type": "keyword", "indexed": true },
+        "line_start": { "type": "integer", "indexed": true },
+        "line_end": { "type": "integer", "indexed": true },
+        "language": { "type": "keyword", "indexed": true },
+        "namespace": { "type": "keyword", "indexed": true },
+        "signature": { "type": "text" },
+        "docstring": { "type": "text" },
+        "code_preview": { "type": "text" },
+        "modifiers": { "type": "keyword", "indexed": true, "is_array": true },
+        "return_type": { "type": "keyword", "indexed": true },
+        "parameters": { "type": "text" },
+        "repo_id": { "type": "keyword", "indexed": true },
+        "last_indexed": { "type": "datetime", "indexed": true },
+        "git_hash": { "type": "keyword" }
+      },
+      "indexes": [
+        { "field": "language", "type": "keyword" },
+        { "field": "symbol_type", "type": "keyword" },
+        { "field": "namespace", "type": "keyword" },
+        { "field": "repo_id", "type": "keyword" }
+      ]
+    },
+    "docstrings": {
+      "description": "Embeddings of documentation and comments for semantic doc search",
+      "vector_config": {
+        "size": 768,
+        "distance": "Cosine",
+        "on_disk": true
+      },
+      "payload_schema": {
+        "symbol_id": { "type": "keyword", "indexed": true },
+        "doc_type": { "type": "keyword", "indexed": true },
+        "content": { "type": "text" },
+        "file_path": { "type": "keyword", "indexed": true },
+        "language": { "type": "keyword", "indexed": true }
+      }
+    },
+    "behavior_summaries": {
+      "description": "LLM-generated behavior summaries for high-level semantic matching",
+      "vector_config": {
+        "size": 768,
+        "distance": "Cosine",
+        "on_disk": true
+      },
+      "payload_schema": {
+        "symbol_id": { "type": "keyword", "indexed": true },
+        "summary": { "type": "text" },
+        "behaviors": { "type": "keyword", "indexed": true, "is_array": true },
+        "generated_at": { "type": "datetime" },
+        "model_version": { "type": "keyword" }
+      },
+      "note": "Optional: only populate if you want LLM-enhanced semantic search"
+    }
+  },
+  "embedding_models": {
+    "development": {
+      "name": "all-minilm",
+      "dimensions": 384,
+      "provider": "ollama",
+      "speed_ms": 79,
+      "notes": "Fastest option, good for development iteration"
+    },
+    "production": {
+      "name": "mxbai-embed-large",
+      "dimensions": 1024,
+      "provider": "ollama",
+      "speed_ms": 122,
+      "mteb_score": 64.7,
+      "notes": "Best retrieval quality, recommended for production"
+    },
+    "balanced": {
+      "name": "nomic-embed-text",
+      "dimensions": 768,
+      "provider": "ollama",
+      "speed_ms": 118,
+      "mteb_score": 62.4,
+      "notes": "Good balance of quality and speed"
+    }
+  }
+}

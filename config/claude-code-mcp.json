@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Claude Code MCP server configuration for Codebase Brain",
+  "instructions": "Add this to your ~/.claude/settings.json or project .claude/settings.json",
+  "mcpServers": {
+    "codebase-brain": {
+      "type": "sse",
+      "url": "http://localhost:3100/sse",
+      "description": "Code intelligence for duplicate prevention and reuse discovery",
+      "headers": {},
+      "timeout": 30000
+    }
+  },
+  "alternative_stdio": {
+    "description": "Use this if running the MCP server directly (not via HTTP)",
+    "mcpServers": {
+      "codebase-brain": {
+        "type": "stdio",
+        "command": "node",
+        "args": ["/home/rscla/projects/codebase-brain/services/mcp-gateway/dist/index.js"],
+        "env": {
+          "QDRANT_URL": "http://localhost:6333",
+          "NEO4J_URL": "bolt://localhost:7687",
+          "NEO4J_USER": "neo4j",
+          "NEO4J_PASSWORD": "codebase-brain-dev",
+          "ZOEKT_URL": "http://localhost:6070",
+          "OLLAMA_URL": "http://localhost:11434",
+          "EMBEDDING_MODEL": "nomic-embed-text"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "codebase-brain-mcp",
+  "version": "0.1.0",
+  "description": "MCP gateway for Codebase Brain code intelligence",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@qdrant/js-client-rest": "^1.7.0",
+    "express": "^4.18.2",
+    "neo4j-driver": "^5.17.0",
+    "pino": "^8.17.2",
+    "pino-pretty": "^10.3.1",
+    "yaml": "^2.3.4",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.5",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3",
+    "vitest": "^1.2.1"
+  }
+}

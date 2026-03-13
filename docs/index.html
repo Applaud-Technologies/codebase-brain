@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Codebase Brain - AI Code Intelligence That Prevents Duplication</title>
+    <meta name="description" content="Stop AI coding assistants from creating duplicate code. Codebase Brain enforces search-before-write for Claude Code and other AI tools.">
+    <style>
+        :root {
+            --bg: #0a0a0b;
+            --surface: #141417;
+            --border: #2a2a2f;
+            --text: #e4e4e7;
+            --text-muted: #71717a;
+            --accent: #6366f1;
+            --accent-glow: rgba(99, 102, 241, 0.15);
+            --green: #22c55e;
+            --red: #ef4444;
+            --yellow: #eab308;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 0 24px;
+        }
+
+        /* Navigation */
+        nav {
+            padding: 20px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        nav .container {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: var(--text);
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .logo-icon {
+            width: 32px;
+            height: 32px;
+            background: linear-gradient(135deg, var(--accent), #8b5cf6);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 32px;
+        }
+
+        .nav-links a {
+            color: var(--text-muted);
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: color 0.2s;
+        }
+
+        .nav-links a:hover {
+            color: var(--text);
+        }
+
+        /* Hero */
+        .hero {
+            padding: 100px 0 80px;
+            text-align: center;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 6px 14px;
+            background: var(--accent-glow);
+            border: 1px solid var(--accent);
+            border-radius: 20px;
+            font-size: 0.85rem;
+            color: var(--accent);
+            margin-bottom: 24px;
+        }
+
+        h1 {
+            font-size: 3.5rem;
+            font-weight: 700;
+            line-height: 1.1;
+            margin-bottom: 24px;
+            background: linear-gradient(to right, var(--text), var(--text-muted));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero p {
+            font-size: 1.25rem;
+            color: var(--text-muted);
+            max-width: 600px;
+            margin: 0 auto 40px;
+        }
+
+        .cta-buttons {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 14px 28px;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 500;
+            text-decoration: none;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #4f46e5;
+            transform: translateY(-2px);
+        }
+
+        .btn-secondary {
+            background: var(--surface);
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+
+        .btn-secondary:hover {
+            border-color: var(--text-muted);
+        }
+
+        /* Problem Section */
+        .problem {
+            padding: 80px 0;
+            border-top: 1px solid var(--border);
+        }
+
+        .section-label {
+            font-size: 0.85rem;
+            color: var(--accent);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: 16px;
+        }
+
+        h2 {
+            font-size: 2.25rem;
+            margin-bottom: 24px;
+        }
+
+        .problem-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 48px;
+            margin-top: 48px;
+        }
+
+        @media (max-width: 768px) {
+            .problem-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .terminal {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .terminal-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 8px;
+        }
+
+        .terminal-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        .terminal-dot.red { background: var(--red); }
+        .terminal-dot.yellow { background: var(--yellow); }
+        .terminal-dot.green { background: var(--green); }
+
+        .terminal-body {
+            padding: 20px;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 0.9rem;
+            line-height: 1.8;
+        }
+
+        .terminal-body .prompt {
+            color: var(--green);
+        }
+
+        .terminal-body .output {
+            color: var(--text-muted);
+        }
+
+        .terminal-body .bad {
+            color: var(--red);
+        }
+
+        .terminal-body .good {
+            color: var(--green);
+        }
+
+        .terminal-body .highlight {
+            color: var(--accent);
+        }
+
+        .comparison-label {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .comparison-label.bad::before {
+            content: "✗";
+            color: var(--red);
+        }
+
+        .comparison-label.good::before {
+            content: "✓";
+            color: var(--green);
+        }
+
+        /* How It Works */
+        .how-it-works {
+            padding: 80px 0;
+            border-top: 1px solid var(--border);
+        }
+
+        .flow-diagram {
+            margin: 48px 0;
+            padding: 40px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+        }
+
+        .flow-steps {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .flow-step {
+            text-align: center;
+            flex: 1;
+            min-width: 120px;
+        }
+
+        .flow-step-number {
+            width: 48px;
+            height: 48px;
+            background: var(--accent-glow);
+            border: 2px solid var(--accent);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 12px;
+            font-weight: 700;
+            color: var(--accent);
+        }
+
+        .flow-step h4 {
+            font-size: 1rem;
+            margin-bottom: 4px;
+        }
+
+        .flow-step p {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+
+        .flow-arrow {
+            color: var(--border);
+            font-size: 1.5rem;
+        }
+
+        @media (max-width: 768px) {
+            .flow-arrow {
+                display: none;
+            }
+        }
+
+        /* Tools */
+        .tools {
+            padding: 80px 0;
+            border-top: 1px solid var(--border);
+        }
+
+        .tools-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 24px;
+            margin-top: 48px;
+        }
+
+        @media (max-width: 768px) {
+            .tools-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .tool-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 28px;
+            transition: border-color 0.2s;
+        }
+
+        .tool-card:hover {
+            border-color: var(--accent);
+        }
+
+        .tool-card h3 {
+            font-size: 1.1rem;
+            margin-bottom: 8px;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            color: var(--accent);
+        }
+
+        .tool-card p {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+        }
+
+        /* Architecture */
+        .architecture {
+            padding: 80px 0;
+            border-top: 1px solid var(--border);
+        }
+
+        .arch-diagram {
+            margin-top: 48px;
+            padding: 40px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 0.85rem;
+            overflow-x: auto;
+        }
+
+        .arch-diagram pre {
+            white-space: pre;
+            color: var(--text-muted);
+        }
+
+        .arch-features {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 24px;
+            margin-top: 32px;
+        }
+
+        @media (max-width: 768px) {
+            .arch-features {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .arch-feature {
+            padding: 24px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+        }
+
+        .arch-feature h4 {
+            font-size: 1rem;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .arch-feature p {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+
+        /* Quick Start */
+        .quickstart {
+            padding: 80px 0;
+            border-top: 1px solid var(--border);
+        }
+
+        .quickstart-code {
+            margin-top: 32px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .quickstart-code pre {
+            padding: 24px;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 0.9rem;
+            overflow-x: auto;
+        }
+
+        .quickstart-code .comment {
+            color: var(--text-muted);
+        }
+
+        .quickstart-code .command {
+            color: var(--green);
+        }
+
+        /* Footer */
+        footer {
+            padding: 40px 0;
+            border-top: 1px solid var(--border);
+            text-align: center;
+        }
+
+        footer p {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+
+        footer a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        footer a:hover {
+            text-decoration: underline;
+        }
+
+        /* Utilities */
+        .text-center {
+            text-align: center;
+        }
+
+        .max-w-2xl {
+            max-width: 42rem;
+            margin-left: auto;
+            margin-right: auto;
+        }
+    </style>
+</head>
+<body>
+    <nav>
+        <div class="container">
+            <a href="#" class="logo">
+                <div class="logo-icon">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5">
+                        <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+                    </svg>
+                </div>
+                Codebase Brain
+            </a>
+            <div class="nav-links">
+                <a href="#how-it-works">How It Works</a>
+                <a href="#tools">Tools</a>
+                <a href="#quickstart">Quick Start</a>
+                <a href="https://github.com/Applaud-Technologies/codebase-brain">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <section class="hero">
+        <div class="container">
+            <span class="badge">Works with Claude Code via MCP</span>
+            <h1>Stop AI from writing<br>duplicate code</h1>
+            <p>Codebase Brain makes AI coding assistants search your codebase before generating new code. Find existing implementations, prevent duplication, maintain consistency.</p>
+            <div class="cta-buttons">
+                <a href="#quickstart" class="btn btn-primary">Get Started</a>
+                <a href="https://github.com/Applaud-Technologies/codebase-brain" class="btn btn-secondary">View on GitHub</a>
+            </div>
+        </div>
+    </section>
+
+    <section class="problem">
+        <div class="container">
+            <p class="section-label">The Problem</p>
+            <h2>AI doesn't know what you've already built</h2>
+            <p style="color: var(--text-muted); max-width: 600px;">Ask an AI to add email validation and it writes a new method—even if you already have three validators in your codebase. Every AI session compounds technical debt.</p>
+
+            <div class="problem-grid">
+                <div>
+                    <p class="comparison-label bad">Without Codebase Brain</p>
+                    <div class="terminal">
+                        <div class="terminal-header">
+                            <span class="terminal-dot red"></span>
+                            <span class="terminal-dot yellow"></span>
+                            <span class="terminal-dot green"></span>
+                        </div>
+                        <div class="terminal-body">
+                            <p><span class="prompt">You:</span> Add email validation</p>
+                            <p><span class="prompt">AI:</span> I'll create a new method...</p>
+                            <p style="margin-top: 12px;"><span class="output">Writing</span> <span class="bad">ValidateEmail()</span></p>
+                            <p><span class="output">Result:</span> <span class="bad">4th email validator in codebase</span></p>
+                        </div>
+                    </div>
+                </div>
+                <div>
+                    <p class="comparison-label good">With Codebase Brain</p>
+                    <div class="terminal">
+                        <div class="terminal-header">
+                            <span class="terminal-dot red"></span>
+                            <span class="terminal-dot yellow"></span>
+                            <span class="terminal-dot green"></span>
+                        </div>
+                        <div class="terminal-body">
+                            <p><span class="prompt">You:</span> Add email validation</p>
+                            <p><span class="prompt">AI:</span> <span class="highlight">Searching existing code...</span></p>
+                            <p style="margin-top: 12px;"><span class="output">Found:</span> <span class="good">EmailValidator.IsValid()</span></p>
+                            <p><span class="output">Match:</span> <span class="good">95% similar</span></p>
+                            <p><span class="prompt">AI:</span> Recommend reusing existing method</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="how-it-works" id="how-it-works">
+        <div class="container">
+            <p class="section-label">How It Works</p>
+            <h2>Search before write</h2>
+            <p style="color: var(--text-muted); max-width: 600px;">Before generating new code, the AI must search your codebase, compare results, and justify why new code is needed.</p>
+
+            <div class="flow-diagram">
+                <div class="flow-steps">
+                    <div class="flow-step">
+                        <div class="flow-step-number">1</div>
+                        <h4>Search</h4>
+                        <p>Find existing implementations</p>
+                    </div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">
+                        <div class="flow-step-number">2</div>
+                        <h4>Compare</h4>
+                        <p>Check for duplicates</p>
+                    </div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">
+                        <div class="flow-step-number">3</div>
+                        <h4>Decide</h4>
+                        <p>Reuse or create new</p>
+                    </div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">
+                        <div class="flow-step-number">4</div>
+                        <h4>Guard</h4>
+                        <p>Validate with evidence</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="tools" id="tools">
+        <div class="container">
+            <p class="section-label">MCP Tools</p>
+            <h2>Four tools that enforce the workflow</h2>
+
+            <div class="tools-grid">
+                <div class="tool-card">
+                    <h3>find_existing_behavior</h3>
+                    <p>Semantic search by description. "Calculate shipping cost" finds <code>ComputeShippingCost()</code> even when names differ.</p>
+                </div>
+                <div class="tool-card">
+                    <h3>find_symbols</h3>
+                    <p>Pattern-based symbol search. Find all methods matching <code>*Shipping*</code> across the codebase.</p>
+                </div>
+                <div class="tool-card">
+                    <h3>detect_duplicates</h3>
+                    <p>Check if proposed code duplicates existing functionality before writing it.</p>
+                </div>
+                <div class="tool-card">
+                    <h3>pre_write_guard</h3>
+                    <p>Blocks code generation unless search evidence is provided. The enforcement mechanism.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="architecture">
+        <div class="container">
+            <p class="section-label">Architecture</p>
+            <h2>Three-layer code intelligence</h2>
+
+            <div class="arch-diagram">
+<pre>
+┌─────────────────┐      MCP Protocol      ┌─────────────────┐
+│   Claude Code   │◄──────────────────────►│  Codebase Brain │
+│  (AI Assistant) │                        │    (Sidecar)    │
+└─────────────────┘                        └────────┬────────┘
+                                                    │
+                            ┌───────────────────────┼───────────────────────┐
+                            ▼                       ▼                       ▼
+                      ┌──────────┐            ┌──────────┐            ┌──────────┐
+                      │  Qdrant  │            │  Neo4j   │            │  Zoekt   │
+                      │ Semantic │            │   Code   │            │ Lexical  │
+                      │  Search  │            │   Graph  │            │  Search  │
+                      └──────────┘            └──────────┘            └──────────┘
+</pre>
+            </div>
+
+            <div class="arch-features">
+                <div class="arch-feature">
+                    <h4>🧠 Semantic</h4>
+                    <p>Vector embeddings understand what code does, not just what it's named. Finds similar behavior across different naming conventions.</p>
+                </div>
+                <div class="arch-feature">
+                    <h4>🔗 Structural</h4>
+                    <p>Code graph tracks calls, dependencies, and relationships. Understands how code connects and what depends on what.</p>
+                </div>
+                <div class="arch-feature">
+                    <h4>📝 Lexical</h4>
+                    <p>Fast exact-match text search. Pattern matching and regex across your entire codebase in milliseconds.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="quickstart" id="quickstart">
+        <div class="container">
+            <p class="section-label">Quick Start</p>
+            <h2>Up and running in 2 minutes</h2>
+
+            <div class="quickstart-code">
+<pre>
+<span class="comment"># Clone and start the services</span>
+<span class="command">git clone https://github.com/Applaud-Technologies/codebase-brain.git</span>
+<span class="command">cd codebase-brain</span>
+<span class="command">docker compose up -d</span>
+
+<span class="comment"># Connect Claude Code to Codebase Brain</span>
+<span class="command">claude mcp add codebase-brain --type http --url http://localhost:3100/mcp</span>
+
+<span class="comment"># Verify connection</span>
+<span class="command">claude mcp list</span>
+<span class="output">codebase-brain: http://localhost:3100/mcp (HTTP) - ✓ Connected</span>
+</pre>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <p>Open source under MIT License · <a href="https://github.com/Applaud-Technologies/codebase-brain">GitHub</a></p>
+        </div>
+    </footer>
+</body>
+</html>

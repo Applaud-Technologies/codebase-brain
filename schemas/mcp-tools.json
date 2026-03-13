@@ -1,0 +1,379 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "name": "codebase-brain",
+  "version": "0.1.0",
+  "description": "Code intelligence MCP server for duplicate prevention and reuse discovery",
+  "tools": [
+    {
+      "name": "find_existing_behavior",
+      "description": "Search for existing code that implements a described behavior. Use this BEFORE writing any new function, method, or class to check if similar functionality already exists. Returns ranked candidates with reuse recommendations.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Natural language description of the behavior you need (e.g., 'validate email format', 'calculate tax for order')"
+          },
+          "language": {
+            "type": "string",
+            "enum": ["csharp", "typescript", "javascript", "python", "go", "java"],
+            "description": "Target programming language"
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Optional namespace/module filter to scope search (e.g., 'MaidCentral.Scheduling')"
+          },
+          "symbol_type": {
+            "type": "string",
+            "enum": ["method", "class", "interface", "any"],
+            "default": "any",
+            "description": "Type of symbol to search for"
+          },
+          "limit": {
+            "type": "integer",
+            "default": 10,
+            "minimum": 1,
+            "maximum": 50,
+            "description": "Maximum number of candidates to return"
+          }
+        },
+        "required": ["description", "language"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "symbol_id": { "type": "string" },
+                "name": { "type": "string" },
+                "signature": { "type": "string" },
+                "file_path": { "type": "string" },
+                "line_number": { "type": "integer" },
+                "namespace": { "type": "string" },
+                "similarity_score": { "type": "number", "minimum": 0, "maximum": 1 },
+                "usage_count": { "type": "integer" },
+                "recommendation": {
+                  "type": "string",
+                  "enum": ["reuse", "extend", "wrap", "new"]
+                },
+                "recommendation_reason": { "type": "string" }
+              }
+            }
+          },
+          "search_metadata": {
+            "type": "object",
+            "properties": {
+              "semantic_matches": { "type": "integer" },
+              "lexical_matches": { "type": "integer" },
+              "structural_matches": { "type": "integer" },
+              "search_time_ms": { "type": "integer" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "find_symbols",
+      "description": "Search for symbols (classes, interfaces, methods, types) by name or pattern. Use this to locate specific code elements or find implementations of interfaces.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Symbol name or pattern (supports wildcards: 'I*Service', 'Get*ById')"
+          },
+          "language": {
+            "type": "string",
+            "enum": ["csharp", "typescript", "javascript", "python", "go", "java", "any"],
+            "default": "any"
+          },
+          "symbol_type": {
+            "type": "string",
+            "enum": ["class", "interface", "method", "property", "field", "enum", "type", "any"],
+            "default": "any"
+          },
+          "return_type": {
+            "type": "string",
+            "description": "Filter by return type (e.g., 'Task<Result<T>>', 'void')"
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Filter by namespace/module"
+          },
+          "modifiers": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["public", "private", "protected", "internal", "static", "async", "abstract", "virtual"]
+            },
+            "description": "Filter by modifiers"
+          },
+          "include_implementations": {
+            "type": "boolean",
+            "default": true,
+            "description": "Include implementations of matched interfaces"
+          },
+          "include_references": {
+            "type": "boolean",
+            "default": false,
+            "description": "Include reference counts for each symbol"
+          },
+          "limit": {
+            "type": "integer",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "trace_usage",
+      "description": "Trace the usage graph of a symbol - who calls it, what it calls, and how central it is to the codebase. Use this to understand impact before modifying code.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "symbol_id": {
+            "type": "string",
+            "description": "Symbol ID from find_symbols or find_existing_behavior"
+          },
+          "symbol_path": {
+            "type": "string",
+            "description": "Alternative: file path and symbol name (e.g., 'src/Services/OrderService.cs:CalculateTotal')"
+          },
+          "depth": {
+            "type": "integer",
+            "default": 2,
+            "minimum": 1,
+            "maximum": 5,
+            "description": "How many levels of callers/callees to traverse"
+          },
+          "include_tests": {
+            "type": "boolean",
+            "default": false,
+            "description": "Include test file references"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "file_path": { "type": "string" },
+              "line_number": { "type": "integer" }
+            }
+          },
+          "callers": {
+            "type": "array",
+            "description": "Symbols that call this symbol (fan-in)"
+          },
+          "callees": {
+            "type": "array",
+            "description": "Symbols that this symbol calls (fan-out)"
+          },
+          "metrics": {
+            "type": "object",
+            "properties": {
+              "fan_in": { "type": "integer" },
+              "fan_out": { "type": "integer" },
+              "centrality_score": { "type": "number" },
+              "test_coverage": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "detect_duplicates",
+      "description": "Check if proposed code duplicates existing functionality. Use this BEFORE creating new methods to prevent code bloat. Provide either code or a description.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Proposed code to check for duplicates"
+          },
+          "description": {
+            "type": "string",
+            "description": "Alternative: natural language description of what the code does"
+          },
+          "language": {
+            "type": "string",
+            "enum": ["csharp", "typescript", "javascript", "python", "go", "java"],
+            "description": "Programming language"
+          },
+          "threshold": {
+            "type": "number",
+            "default": 0.7,
+            "minimum": 0.5,
+            "maximum": 1.0,
+            "description": "Similarity threshold (0.7 = 70% similar)"
+          }
+        },
+        "required": ["language"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "has_duplicates": { "type": "boolean" },
+          "duplicates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "symbol_id": { "type": "string" },
+                "name": { "type": "string" },
+                "file_path": { "type": "string" },
+                "line_number": { "type": "integer" },
+                "similarity": { "type": "number" },
+                "duplicate_type": {
+                  "type": "string",
+                  "enum": ["exact", "near", "semantic"]
+                },
+                "overlap_explanation": { "type": "string" }
+              }
+            }
+          },
+          "recommendation": {
+            "type": "string",
+            "enum": ["proceed", "reuse_existing", "extend_existing", "needs_review"]
+          }
+        }
+      }
+    },
+    {
+      "name": "pre_write_guard",
+      "description": "REQUIRED before any new method/class creation. Validates that proper search was performed and justifies why new code is needed. Returns pass/fail with evidence.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "proposed_change": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["new_method", "new_class", "new_file", "modify_existing"]
+              },
+              "name": { "type": "string" },
+              "description": { "type": "string" },
+              "file_path": { "type": "string" },
+              "code_preview": { "type": "string" }
+            },
+            "required": ["type", "name", "description"]
+          },
+          "search_evidence": {
+            "type": "object",
+            "properties": {
+              "behavior_search_performed": { "type": "boolean" },
+              "symbol_search_performed": { "type": "boolean" },
+              "duplicate_check_performed": { "type": "boolean" },
+              "candidates_reviewed": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Symbol IDs of candidates that were reviewed"
+              },
+              "rejection_reasons": {
+                "type": "object",
+                "additionalProperties": { "type": "string" },
+                "description": "Map of symbol_id -> reason why it was insufficient"
+              }
+            }
+          },
+          "justification": {
+            "type": "string",
+            "description": "Why new code is warranted despite existing candidates"
+          }
+        },
+        "required": ["proposed_change", "search_evidence", "justification"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "approved": { "type": "boolean" },
+          "verdict": {
+            "type": "string",
+            "enum": ["proceed", "blocked", "needs_human_review"]
+          },
+          "missing_steps": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Analysis steps that were skipped"
+          },
+          "concerns": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Potential issues with the proposed change"
+          },
+          "suggestions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "action": { "type": "string" },
+                "target_symbol": { "type": "string" },
+                "rationale": { "type": "string" }
+              }
+            }
+          },
+          "audit_record": {
+            "type": "object",
+            "description": "Logged for compliance/review"
+          }
+        }
+      }
+    },
+    {
+      "name": "get_architecture_context",
+      "description": "Get architectural context for a file or namespace - what layer it belongs to, what it should/shouldn't depend on, and relevant patterns.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "type": "string",
+            "description": "Path to file"
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Or specify namespace directly"
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "layer": {
+            "type": "string",
+            "enum": ["domain", "application", "infrastructure", "presentation", "shared", "tests"]
+          },
+          "bounded_context": { "type": "string" },
+          "allowed_dependencies": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "forbidden_dependencies": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "patterns_in_use": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Patterns used in this area (e.g., 'Repository', 'CQRS Handler')"
+          },
+          "similar_files": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Files in the same architectural area to use as examples"
+          }
+        }
+      }
+    }
+  ]
+}
