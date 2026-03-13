@@ -13,6 +13,14 @@ import express, { Request, Response } from "express";
 import { loadConfig, RankingConfig } from "./config.js";
 import { ReuseScorer } from "./scoring.js";
 import { EmbeddingService } from "./embeddings.js";
+import {
+  IndexProgress,
+  indexRepository,
+  startWatcher,
+  stopWatcher,
+  listWatchers,
+  getSupportedLanguages,
+} from "./indexer.js";
 
 // =============================================================================
 // CONFIGURATION
@@ -51,7 +59,7 @@ async function initClients() {
     neo4j.auth.basic(config.neo4jUser, config.neo4jPassword)
   );
 
-  embeddingService = new EmbeddingService(config.ollamaUrl, config.embeddingModel);
+  embeddingService = EmbeddingService.withDefaults(config.ollamaUrl);
   rankingConfig = await loadConfig();
   scorer = new ReuseScorer(rankingConfig);
 
@@ -72,39 +80,67 @@ async function findExistingBehavior(params: {
   const limit = Math.floor(params.limit || 10);  // Ensure integer for Qdrant
   const startTime = Date.now();
 
-  // Generate embedding for the description
-  const embedding = await embeddingService.embed(params.description);
+  // Generate embedding for the description (used for both vector searches)
+  const embedding = await embeddingService.embed(params.description, "description");
 
-  // Search Qdrant for semantic matches
-  const semanticResults = await qdrant.search("code_chunks", {
-    vector: embedding,
-    filter: {
-      must: [
-        { key: "language", match: { value: params.language } },
-        ...(params.namespace
-          ? [{ key: "namespace", match: { value: params.namespace } }]
-          : []),
-        ...(params.symbol_type && params.symbol_type !== "any"
-          ? [{ key: "symbol_type", match: { value: params.symbol_type } }]
-          : []),
-      ],
-    },
-    limit: limit * 2, // Get extra for scoring/filtering
-    with_payload: true,
-  });
+  // Build filter
+  const filter = {
+    must: [
+      { key: "language", match: { value: params.language } },
+      ...(params.namespace
+        ? [{ key: "namespace", match: { value: params.namespace } }]
+        : []),
+      ...(params.symbol_type && params.symbol_type !== "any"
+        ? [{ key: "symbol_type", match: { value: params.symbol_type } }]
+        : []),
+    ],
+  };
+
+  // Search both vectors in parallel and merge results
+  const [descriptionResults, codeResults] = await Promise.all([
+    qdrant.search("code_chunks", {
+      vector: { name: "description", vector: embedding },
+      filter,
+      limit: limit * 2,
+      with_payload: true,
+    }).catch(() => []),  // Fallback for old collections without named vectors
+    qdrant.search("code_chunks", {
+      vector: { name: "code", vector: embedding },
+      filter,
+      limit: limit * 2,
+      with_payload: true,
+    }).catch(() => []),  // Fallback for old collections without named vectors
+  ]);
+
+  // Merge results, taking max similarity per symbol
+  const mergedResults = new Map<string, { payload: Record<string, unknown>; score: number; matchedVector: string }>();
+
+  for (const result of descriptionResults) {
+    const payload = result.payload as Record<string, unknown>;
+    const symbolId = payload.symbol_id as string;
+    mergedResults.set(symbolId, { payload, score: result.score || 0, matchedVector: "description" });
+  }
+
+  for (const result of codeResults) {
+    const payload = result.payload as Record<string, unknown>;
+    const symbolId = payload.symbol_id as string;
+    const existing = mergedResults.get(symbolId);
+    if (!existing || (result.score || 0) > existing.score) {
+      mergedResults.set(symbolId, { payload, score: result.score || 0, matchedVector: "code" });
+    }
+  }
 
   // Enrich with usage data from Neo4j (run sequentially to avoid session conflicts)
   const candidates = [];
-  for (const result of semanticResults) {
-    const payload = result.payload as Record<string, unknown>;
-    const symbolId = payload.symbol_id as string;
+  for (const [symbolId, result] of mergedResults) {
+    const { payload, score } = result;
 
     // Get usage count from Neo4j (use payload if available, skip Neo4j for now)
     const usageCount = (payload.usage_count as number) || 0;
 
     // Score the candidate
-    const score = scorer.score({
-      semanticSimilarity: result.score || 0,
+    const finalScore = scorer.score({
+      semanticSimilarity: score,
       usageCount,
       namespace: payload.namespace as string,
       targetNamespace: params.namespace,
@@ -120,10 +156,10 @@ async function findExistingBehavior(params: {
       file_path: payload.file_path,
       line_number: payload.line_start,
       namespace: payload.namespace,
-      similarity_score: score.total,
+      similarity_score: finalScore.total,
       usage_count: usageCount,
-      recommendation: score.recommendation,
-      recommendation_reason: score.reason,
+      recommendation: finalScore.recommendation,
+      recommendation_reason: finalScore.reason,
     });
   }
 
@@ -134,7 +170,9 @@ async function findExistingBehavior(params: {
   return {
     candidates: topCandidates,
     search_metadata: {
-      semantic_matches: semanticResults.length,
+      description_matches: descriptionResults.length,
+      code_matches: codeResults.length,
+      merged_matches: mergedResults.size,
       lexical_matches: 0, // TODO: integrate Zoekt
       structural_matches: 0, // TODO: integrate Roslyn
       search_time_ms: Date.now() - startTime,
@@ -361,27 +399,66 @@ async function detectDuplicates(params: {
   description?: string;
   language: string;
   threshold?: number;
+  ask_user_on_match?: boolean;
 }) {
   const threshold = params.threshold || 0.7;
+  const askUserOnMatch = params.ask_user_on_match ?? false;
 
-  // Generate embedding from code or description
-  const textToEmbed = params.code || params.description || "";
-  const embedding = await embeddingService.embed(textToEmbed);
+  const filter = {
+    must: [{ key: "language", match: { value: params.language } }],
+  };
 
-  // Search for similar code chunks
-  const results = await qdrant.search("code_chunks", {
-    vector: embedding,
-    filter: {
-      must: [{ key: "language", match: { value: params.language } }],
-    },
-    limit: 20,
-    with_payload: true,
-    score_threshold: threshold,
-  });
+  // Build search promises for both vectors
+  const searchPromises: Promise<unknown[]>[] = [];
 
-  const duplicates = results.map((result) => {
-    const payload = result.payload as Record<string, unknown>;
-    const similarity = result.score || 0;
+  if (params.description) {
+    const descEmbedding = await embeddingService.embed(params.description, "description");
+    searchPromises.push(
+      qdrant.search("code_chunks", {
+        vector: { name: "description", vector: descEmbedding },
+        filter,
+        limit: 20,
+        with_payload: true,
+        score_threshold: threshold,
+      }).catch(() => [])
+    );
+  }
+
+  if (params.code) {
+    const codeEmbedding = await embeddingService.embed(params.code, "code");
+    searchPromises.push(
+      qdrant.search("code_chunks", {
+        vector: { name: "code", vector: codeEmbedding },
+        filter,
+        limit: 20,
+        with_payload: true,
+        score_threshold: threshold,
+      }).catch(() => [])
+    );
+  }
+
+  // If neither provided, fall back to empty search
+  if (searchPromises.length === 0) {
+    return { has_duplicates: false, duplicates: [], recommendation: "proceed" as const };
+  }
+
+  const allResults = await Promise.all(searchPromises);
+
+  // Merge results, taking max similarity per symbol
+  const mergedResults = new Map<string, { payload: Record<string, unknown>; score: number }>();
+  for (const results of allResults) {
+    for (const result of results as Array<{ payload?: Record<string, unknown>; score: number }>) {
+      const payload = result.payload || {};
+      const symbolId = payload.symbol_id as string;
+      if (!symbolId) continue;
+      const existing = mergedResults.get(symbolId);
+      if (!existing || result.score > existing.score) {
+        mergedResults.set(symbolId, { payload, score: result.score });
+      }
+    }
+  }
+
+  const duplicates = Array.from(mergedResults.values()).map(({ payload, score: similarity }) => {
 
     // Classify duplicate type
     let duplicateType: "exact" | "near" | "semantic" = "semantic";
@@ -416,6 +493,28 @@ async function detectDuplicates(params: {
     recommendation = "needs_review";
   }
 
+  // If matches found and ask_user_on_match is true, include user decision prompt
+  if (hasDuplicates && askUserOnMatch) {
+    const topMatch = duplicates[0];
+    return {
+      has_duplicates: hasDuplicates,
+      duplicates,
+      recommendation,
+      requires_user_decision: true,
+      user_prompt: {
+        message: `Found existing code that may already do what you need:\n\n` +
+          `**${topMatch.name}** in \`${topMatch.file_path}\` (${Math.round(topMatch.similarity * 100)}% similar)\n\n` +
+          `${topMatch.overlap_explanation}`,
+        options: [
+          { id: "reuse", label: "Reuse existing code", description: `Use ${topMatch.name} instead of creating new code` },
+          { id: "extend", label: "Extend existing code", description: `Add functionality to ${topMatch.name}` },
+          { id: "create_new", label: "Create new anyway", description: "Proceed with creating new code (explain why existing doesn't fit)" },
+          { id: "show_more", label: "Show me the existing code", description: `Read ${topMatch.file_path} to review before deciding` },
+        ],
+      },
+    };
+  }
+
   return {
     has_duplicates: hasDuplicates,
     duplicates,
@@ -439,11 +538,16 @@ async function preWriteGuard(params: {
     rejection_reasons?: Record<string, string>;
   };
   justification: string;
+  ask_user_on_block?: boolean;
 }) {
   const missingSteps: string[] = [];
   const concerns: string[] = [];
   const suggestions: Array<{ action: string; target_symbol?: string; rationale: string }> =
     [];
+  const askUserOnBlock = params.ask_user_on_block ?? true; // Default to true for interactive mode
+
+  // Track duplicate info for user prompt
+  let duplicateInfo: { name: string; file_path: string; similarity: number; symbol_id: string } | null = null;
 
   // Check required searches
   if (!params.search_evidence.behavior_search_performed) {
@@ -479,6 +583,13 @@ async function preWriteGuard(params: {
 
     if (duplicateResult.has_duplicates) {
       const topDup = duplicateResult.duplicates[0];
+      duplicateInfo = {
+        name: topDup.name as string,
+        file_path: topDup.file_path as string,
+        similarity: topDup.similarity,
+        symbol_id: topDup.symbol_id as string,
+      };
+
       if (topDup.duplicate_type === "exact") {
         concerns.push(`Exact duplicate found: ${topDup.name} at ${topDup.file_path}`);
         suggestions.push({
@@ -511,7 +622,8 @@ async function preWriteGuard(params: {
     verdict = "needs_human_review";
   }
 
-  return {
+  // Build base response
+  const response: Record<string, unknown> = {
     approved,
     verdict,
     missing_steps: missingSteps,
@@ -524,6 +636,60 @@ async function preWriteGuard(params: {
       verdict,
     },
   };
+
+  // Add user prompt when blocked/needs_review and we have duplicate info
+  if (!approved && askUserOnBlock && duplicateInfo) {
+    response.requires_user_decision = true;
+    response.user_prompt = {
+      message: `**Write blocked:** Found existing code that does what you're trying to create.\n\n` +
+        `**${duplicateInfo.name}** in \`${duplicateInfo.file_path}\` (${Math.round(duplicateInfo.similarity * 100)}% similar)\n\n` +
+        `Creating \`${params.proposed_change.name}\` would introduce duplicate code.`,
+      options: [
+        {
+          id: "reuse",
+          label: "Reuse existing code",
+          description: `Use ${duplicateInfo.name} instead of creating ${params.proposed_change.name}`,
+        },
+        {
+          id: "extend",
+          label: "Extend existing code",
+          description: `Add the new functionality to ${duplicateInfo.name}`,
+        },
+        {
+          id: "override",
+          label: "Create anyway (with justification)",
+          description: "Proceed despite duplicate - you'll need to explain why",
+        },
+        {
+          id: "show_existing",
+          label: "Show me the existing code",
+          description: `Read ${duplicateInfo.file_path} before deciding`,
+        },
+      ],
+    };
+  } else if (!approved && askUserOnBlock && missingSteps.length > 0) {
+    // Blocked due to missing search steps
+    response.requires_user_decision = true;
+    response.user_prompt = {
+      message: `**Write blocked:** Required search steps were not completed.\n\n` +
+        `Missing: ${missingSteps.join(", ")}\n\n` +
+        `Codebase Brain requires searching for existing code before creating new code.`,
+      options: [
+        {
+          id: "run_searches",
+          label: "Run the searches now",
+          description: "Execute find_existing_behavior and find_symbols before proceeding",
+        },
+        {
+          id: "override",
+          label: "Skip searches (not recommended)",
+          description: "Proceed without checking for existing code",
+        },
+      ],
+    };
+  }
+
+  return response;
 }
 
 async function getArchitectureContext(params: { file_path?: string; namespace?: string }) {
@@ -612,36 +778,10 @@ async function getArchitectureContext(params: { file_path?: string; namespace?: 
 }
 
 // =============================================================================
-// REPOSITORY INDEXING
+// REPOSITORY INDEXING (uses indexer module)
 // =============================================================================
 
 import * as fs from "fs";
-import * as path from "path";
-
-interface IndexedSymbol {
-  id: string;
-  name: string;
-  qualified_name: string;
-  symbol_type: string;
-  file_path: string;
-  line_start: number;
-  line_end: number;
-  signature: string;
-  namespace: string;
-  language: string;
-  description: string;
-}
-
-interface IndexProgress {
-  status: "running" | "completed" | "failed";
-  files_found: number;
-  files_processed: number;
-  symbols_indexed: number;
-  current_file?: string;
-  errors: string[];
-  started_at: string;
-  completed_at?: string;
-}
 
 // Store active indexing jobs
 const indexingJobs = new Map<string, IndexProgress>();
@@ -650,16 +790,25 @@ async function indexRepo(params: {
   repo_path: string;
   language?: string;
   incremental?: boolean;
+  use_llm_descriptions?: boolean;
   collection_name?: string;
 }): Promise<{ job_id: string; status: string; message: string }> {
   const jobId = randomUUID();
   const repoPath = params.repo_path;
   const language = params.language || "csharp";
   const collectionName = params.collection_name || "code_chunks";
+  const incremental = params.incremental || false;
+  const useLlmDescriptions = params.use_llm_descriptions || false;
 
   // Validate repo path exists
   if (!fs.existsSync(repoPath)) {
     return { job_id: jobId, status: "failed", message: `Path not found: ${repoPath}` };
+  }
+
+  // Validate language is supported
+  const supportedLangs = getSupportedLanguages();
+  if (!supportedLangs.includes(language)) {
+    return { job_id: jobId, status: "failed", message: `Unsupported language: ${language}. Supported: ${supportedLangs.join(", ")}` };
   }
 
   // Initialize progress
@@ -667,14 +816,29 @@ async function indexRepo(params: {
     status: "running",
     files_found: 0,
     files_processed: 0,
+    files_skipped: 0,
     symbols_indexed: 0,
     errors: [],
     started_at: new Date().toISOString(),
   };
   indexingJobs.set(jobId, progress);
 
-  // Run indexing in background
-  indexRepoAsync(jobId, repoPath, language, collectionName, progress).catch((err) => {
+  // Run indexing in background using the indexer module
+  indexRepository(
+    {
+      repoPath,
+      language,
+      collectionName,
+      incremental,
+      useLlmDescriptions,
+    },
+    progress,
+    qdrant,
+    neo4jDriver,
+    embeddingService,
+    config.ollamaUrl,
+    config.embeddingDimensions
+  ).catch((err) => {
     progress.status = "failed";
     progress.errors.push(err.message);
     progress.completed_at = new Date().toISOString();
@@ -685,384 +849,6 @@ async function indexRepo(params: {
     status: "started",
     message: `Indexing started for ${repoPath}. Use get_index_status to check progress.`,
   };
-}
-
-async function indexRepoAsync(
-  jobId: string,
-  repoPath: string,
-  language: string,
-  collectionName: string,
-  progress: IndexProgress
-): Promise<void> {
-  const startTime = Date.now();
-  logger.info({ jobId, repoPath, language }, "Starting repository indexing");
-
-  try {
-    // Ensure Qdrant collection exists
-    await ensureQdrantCollection(collectionName);
-
-    // Find all source files
-    const extensions = getExtensionsForLanguage(language);
-    const files = findSourceFiles(repoPath, extensions);
-    progress.files_found = files.length;
-    logger.info({ jobId, fileCount: files.length }, "Found source files");
-
-    // Check for solution file (C# specific)
-    const solutionFile = findSolutionFile(repoPath);
-    let symbols: IndexedSymbol[] = [];
-
-    if (solutionFile && language === "csharp") {
-      // Use Roslyn worker for full analysis
-      logger.info({ jobId, solutionFile }, "Using Roslyn worker for analysis");
-      try {
-        symbols = await analyzeWithRoslyn(solutionFile, repoPath, progress);
-      } catch (err) {
-        logger.warn({ jobId, error: (err as Error).message }, "Roslyn analysis failed, falling back to regex");
-        symbols = await parseFilesWithRegex(files, language, repoPath, progress);
-      }
-    } else {
-      // Use regex-based parsing for standalone files
-      symbols = await parseFilesWithRegex(files, language, repoPath, progress);
-    }
-
-    logger.info({ jobId, symbolCount: symbols.length }, "Extracted symbols");
-
-    // Generate embeddings and store in Qdrant
-    let indexed = 0;
-    const batchSize = 10;
-
-    for (let i = 0; i < symbols.length; i += batchSize) {
-      const batch = symbols.slice(i, i + batchSize);
-
-      // Generate embeddings for batch
-      const embeddings = await Promise.all(
-        batch.map((s) => embeddingService.embed(s.description))
-      );
-
-      // Prepare points for Qdrant
-      const points = batch.map((symbol, idx) => ({
-        id: hashString(symbol.id),
-        vector: embeddings[idx],
-        payload: {
-          symbol_id: symbol.id,
-          name: symbol.name,
-          qualified_name: symbol.qualified_name,
-          symbol_type: symbol.symbol_type,
-          file_path: symbol.file_path,
-          line_start: symbol.line_start,
-          line_end: symbol.line_end,
-          signature: symbol.signature,
-          namespace: symbol.namespace,
-          language: symbol.language,
-          usage_count: 0,
-        },
-      }));
-
-      // Upsert to Qdrant
-      await qdrant.upsert(collectionName, { points });
-
-      // Store in Neo4j
-      await storeSymbolsInNeo4j(batch);
-
-      indexed += batch.length;
-      progress.symbols_indexed = indexed;
-      logger.debug({ jobId, indexed, total: symbols.length }, "Indexing progress");
-    }
-
-    progress.status = "completed";
-    progress.completed_at = new Date().toISOString();
-
-    const duration = Date.now() - startTime;
-    logger.info(
-      { jobId, symbols: symbols.length, duration, filesProcessed: progress.files_processed },
-      "Repository indexing completed"
-    );
-  } catch (err) {
-    progress.status = "failed";
-    progress.errors.push((err as Error).message);
-    progress.completed_at = new Date().toISOString();
-    logger.error({ jobId, error: (err as Error).message }, "Repository indexing failed");
-    throw err;
-  }
-}
-
-async function ensureQdrantCollection(collectionName: string): Promise<void> {
-  try {
-    await qdrant.getCollection(collectionName);
-  } catch {
-    // Collection doesn't exist, create it
-    await qdrant.createCollection(collectionName, {
-      vectors: {
-        size: config.embeddingDimensions,
-        distance: "Cosine",
-      },
-    });
-    logger.info({ collectionName }, "Created Qdrant collection");
-  }
-}
-
-function getExtensionsForLanguage(language: string): string[] {
-  const extensionMap: Record<string, string[]> = {
-    csharp: [".cs"],
-    typescript: [".ts", ".tsx"],
-    javascript: [".js", ".jsx"],
-    python: [".py"],
-  };
-  return extensionMap[language] || [".cs"];
-}
-
-function findSourceFiles(dir: string, extensions: string[]): string[] {
-  const files: string[] = [];
-
-  function walk(currentDir: string) {
-    const entries = fs.readdirSync(currentDir, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(currentDir, entry.name);
-
-      // Skip common non-source directories
-      if (entry.isDirectory()) {
-        if (["node_modules", "bin", "obj", ".git", ".vs", "packages"].includes(entry.name)) {
-          continue;
-        }
-        walk(fullPath);
-      } else if (entry.isFile()) {
-        if (extensions.some((ext) => entry.name.endsWith(ext))) {
-          files.push(fullPath);
-        }
-      }
-    }
-  }
-
-  walk(dir);
-  return files;
-}
-
-function findSolutionFile(dir: string): string | null {
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (entry.isFile() && entry.name.endsWith(".sln")) {
-      return path.join(dir, entry.name);
-    }
-  }
-  return null;
-}
-
-async function analyzeWithRoslyn(
-  solutionPath: string,
-  repoPath: string,
-  progress: IndexProgress
-): Promise<IndexedSymbol[]> {
-  const response = await fetch(`${config.roslynUrl}/analyze`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ SolutionPath: solutionPath }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Roslyn analysis failed: ${response.statusText}`);
-  }
-
-  const result = await response.json() as {
-    Symbols: Array<{
-      Name: string;
-      QualifiedName: string;
-      Kind: string;
-      FilePath: string;
-      LineStart: number;
-      LineEnd: number;
-      Signature: string;
-      Namespace: string;
-    }>;
-  };
-
-  progress.files_processed = progress.files_found;
-
-  return result.Symbols.map((s) => ({
-    id: `${repoPath}:${s.QualifiedName}`,
-    name: s.Name,
-    qualified_name: s.QualifiedName,
-    symbol_type: s.Kind.toLowerCase(),
-    file_path: s.FilePath,
-    line_start: s.LineStart,
-    line_end: s.LineEnd,
-    signature: s.Signature || s.Name,
-    namespace: s.Namespace || "",
-    language: "csharp",
-    description: generateDescription(s.Name, s.Kind, s.Signature, s.Namespace),
-  }));
-}
-
-async function parseFilesWithRegex(
-  files: string[],
-  language: string,
-  repoPath: string,
-  progress: IndexProgress
-): Promise<IndexedSymbol[]> {
-  const symbols: IndexedSymbol[] = [];
-
-  for (const filePath of files) {
-    try {
-      progress.current_file = filePath;
-      const content = fs.readFileSync(filePath, "utf-8");
-      const relativePath = path.relative(repoPath, filePath);
-      const fileSymbols = parseFileContent(content, relativePath, language, repoPath);
-      symbols.push(...fileSymbols);
-      progress.files_processed++;
-    } catch (err) {
-      progress.errors.push(`Failed to parse ${filePath}: ${(err as Error).message}`);
-    }
-  }
-
-  return symbols;
-}
-
-function parseFileContent(
-  content: string,
-  relativePath: string,
-  language: string,
-  repoPath: string
-): IndexedSymbol[] {
-  const symbols: IndexedSymbol[] = [];
-
-  // Extract namespace
-  let currentNamespace = "";
-  const namespaceMatch = content.match(/namespace\s+([\w.]+)/);
-  if (namespaceMatch) {
-    currentNamespace = namespaceMatch[1];
-  }
-
-  // Regex patterns for C#
-  const classPattern = /(?:public|private|internal|protected)?\s*(?:static|abstract|sealed|partial)?\s*class\s+(\w+)/g;
-  const interfacePattern = /(?:public|private|internal|protected)?\s*interface\s+(I\w+)/g;
-  const methodPattern = /(?:public|private|internal|protected)\s+(?:static\s+)?(?:async\s+)?(?:virtual\s+)?(?:override\s+)?(?:[\w<>\[\],\s]+)\s+(\w+)\s*\([^)]*\)/g;
-
-  // Find classes
-  let match;
-  while ((match = classPattern.exec(content)) !== null) {
-    const lineNumber = content.substring(0, match.index).split("\n").length;
-    const name = match[1];
-    symbols.push({
-      id: `${repoPath}:${currentNamespace}.${name}`,
-      name,
-      qualified_name: `${currentNamespace}.${name}`,
-      symbol_type: "class",
-      file_path: relativePath,
-      line_start: lineNumber,
-      line_end: lineNumber,
-      signature: match[0].trim(),
-      namespace: currentNamespace,
-      language,
-      description: generateDescription(name, "class", match[0].trim(), currentNamespace),
-    });
-  }
-
-  // Find interfaces
-  while ((match = interfacePattern.exec(content)) !== null) {
-    const lineNumber = content.substring(0, match.index).split("\n").length;
-    const name = match[1];
-    symbols.push({
-      id: `${repoPath}:${currentNamespace}.${name}`,
-      name,
-      qualified_name: `${currentNamespace}.${name}`,
-      symbol_type: "interface",
-      file_path: relativePath,
-      line_start: lineNumber,
-      line_end: lineNumber,
-      signature: match[0].trim(),
-      namespace: currentNamespace,
-      language,
-      description: generateDescription(name, "interface", match[0].trim(), currentNamespace),
-    });
-  }
-
-  // Find methods
-  while ((match = methodPattern.exec(content)) !== null) {
-    const lineNumber = content.substring(0, match.index).split("\n").length;
-    const name = match[1];
-    // Skip constructors and common false positives
-    if (["if", "for", "while", "switch", "catch", "using", "lock", "return"].includes(name)) {
-      continue;
-    }
-    symbols.push({
-      id: `${repoPath}:${currentNamespace}.${name}`,
-      name,
-      qualified_name: `${currentNamespace}.${name}`,
-      symbol_type: "method",
-      file_path: relativePath,
-      line_start: lineNumber,
-      line_end: lineNumber,
-      signature: match[0].trim(),
-      namespace: currentNamespace,
-      language,
-      description: generateDescription(name, "method", match[0].trim(), currentNamespace),
-    });
-  }
-
-  return symbols;
-}
-
-function generateDescription(name: string, kind: string, signature: string, namespace: string): string {
-  // Convert PascalCase to readable text
-  const readable = name.replace(/([A-Z])/g, " $1").trim().toLowerCase();
-
-  // Generate a natural language description
-  switch (kind.toLowerCase()) {
-    case "class":
-      return `${readable} class in ${namespace}. ${signature}`;
-    case "interface":
-      return `${readable} interface defining contract in ${namespace}`;
-    case "method":
-      return `${readable} method. ${signature}`;
-    default:
-      return `${kind} ${readable} in ${namespace}`;
-  }
-}
-
-async function storeSymbolsInNeo4j(symbols: IndexedSymbol[]): Promise<void> {
-  const session = neo4jDriver.session();
-  try {
-    for (const symbol of symbols) {
-      await session.run(
-        `MERGE (s:Symbol {id: $id})
-         SET s.name = $name,
-             s.qualified_name = $qualified_name,
-             s.symbol_type = $symbol_type,
-             s.file_path = $file_path,
-             s.line_start = $line_start,
-             s.namespace = $namespace,
-             s.language = $language,
-             s.signature = $signature
-         MERGE (f:File {path: $file_path})
-         MERGE (s)-[:DEFINED_IN]->(f)
-         WITH s
-         MERGE (n:Namespace {name: $namespace})
-         MERGE (s)-[:IN_NAMESPACE]->(n)`,
-        {
-          id: symbol.id,
-          name: symbol.name,
-          qualified_name: symbol.qualified_name,
-          symbol_type: symbol.symbol_type,
-          file_path: symbol.file_path,
-          line_start: symbol.line_start,
-          namespace: symbol.namespace,
-          language: symbol.language,
-          signature: symbol.signature,
-        }
-      );
-    }
-  } finally {
-    await session.close();
-  }
-}
-
-function hashString(str: string): number {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    const char = str.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash; // Convert to 32-bit integer
-  }
-  return Math.abs(hash);
 }
 
 function getIndexStatus(jobId: string): IndexProgress | null {
@@ -1137,7 +923,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "detect_duplicates",
-        description: "Check if proposed code duplicates existing functionality.",
+        description: "Check if proposed code duplicates existing functionality. Set ask_user_on_match=true to get a formatted prompt for user confirmation.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1145,13 +931,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             description: { type: "string", description: "Or describe what the code does" },
             language: { type: "string" },
             threshold: { type: "number", default: 0.7 },
+            ask_user_on_match: { type: "boolean", default: false, description: "If true and matches found, returns user_prompt with options to reuse/extend/create" },
           },
           required: ["language"],
         },
       },
       {
         name: "pre_write_guard",
-        description: "REQUIRED before creating new code. Validates search evidence and justification.",
+        description: "REQUIRED before creating new code. Validates search evidence and justification. Returns user_prompt when blocked.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1176,6 +963,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 rejection_reasons: { type: "object" },
               },
             },
+            ask_user_on_block: { type: "boolean", default: true, description: "If true (default), returns user_prompt with options when blocked" },
             justification: { type: "string" },
           },
           required: ["proposed_change", "search_evidence", "justification"],
@@ -1330,6 +1118,37 @@ app.get("/api/index/:jobId", async (req: Request, res: Response) => {
   }
 });
 
+// File watcher endpoints
+app.post("/api/watch", async (req: Request, res: Response) => {
+  try {
+    const { repo_path, language, use_llm_descriptions } = req.body;
+    const watchId = randomUUID();
+    const result = startWatcher(
+      watchId,
+      repo_path,
+      language || "csharp",
+      "code_chunks",
+      qdrant,
+      neo4jDriver,
+      embeddingService,
+      config.ollamaUrl,
+      use_llm_descriptions || false
+    );
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+app.delete("/api/watch/:watchId", async (req: Request, res: Response) => {
+  const result = stopWatcher(req.params.watchId);
+  res.json(result);
+});
+
+app.get("/api/watchers", async (_req: Request, res: Response) => {
+  res.json(listWatchers());
+});
+
 // =============================================================================
 // STREAMABLE HTTP TRANSPORT FOR MCP
 // =============================================================================
@@ -1377,7 +1196,7 @@ function createMcpServer(): Server {
         },
         {
           name: "detect_duplicates",
-          description: "Check if proposed code duplicates existing functionality.",
+          description: "Check if proposed code duplicates existing functionality. Set ask_user_on_match=true for interactive confirmation.",
           inputSchema: {
             type: "object",
             properties: {
@@ -1385,19 +1204,21 @@ function createMcpServer(): Server {
               description: { type: "string" },
               language: { type: "string" },
               threshold: { type: "number", default: 0.7 },
+              ask_user_on_match: { type: "boolean", default: false },
             },
             required: ["language"],
           },
         },
         {
           name: "pre_write_guard",
-          description: "REQUIRED before creating new code. Validates search evidence.",
+          description: "REQUIRED before creating new code. Validates search evidence. Returns user_prompt when blocked.",
           inputSchema: {
             type: "object",
             properties: {
               proposed_change: { type: "object" },
               search_evidence: { type: "object" },
               justification: { type: "string" },
+              ask_user_on_block: { type: "boolean", default: true },
             },
             required: ["proposed_change", "search_evidence", "justification"],
           },
@@ -1410,7 +1231,8 @@ function createMcpServer(): Server {
             properties: {
               repo_path: { type: "string", description: "Absolute path to the repository root" },
               language: { type: "string", enum: ["csharp", "typescript", "javascript", "python"], default: "csharp" },
-              incremental: { type: "boolean", default: false, description: "Only index changed files" },
+              incremental: { type: "boolean", default: false, description: "Only index changed files (compares file hashes)" },
+              use_llm_descriptions: { type: "boolean", default: false, description: "Use LLM to generate semantic descriptions (slower but better quality)" },
               collection_name: { type: "string", default: "code_chunks", description: "Qdrant collection name" },
             },
             required: ["repo_path"],
@@ -1425,6 +1247,38 @@ function createMcpServer(): Server {
               job_id: { type: "string", description: "The job ID returned by index_repo" },
             },
             required: ["job_id"],
+          },
+        },
+        {
+          name: "watch_repo",
+          description: "Start watching a repository for file changes. Automatically re-indexes modified files.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              repo_path: { type: "string", description: "Absolute path to the repository root" },
+              language: { type: "string", enum: ["csharp", "typescript", "javascript", "python"], default: "csharp" },
+              use_llm_descriptions: { type: "boolean", default: false, description: "Use LLM to generate semantic descriptions" },
+            },
+            required: ["repo_path"],
+          },
+        },
+        {
+          name: "stop_watcher",
+          description: "Stop watching a repository for changes.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              watch_id: { type: "string", description: "The watch ID returned by watch_repo" },
+            },
+            required: ["watch_id"],
+          },
+        },
+        {
+          name: "list_watchers",
+          description: "List all active file watchers.",
+          inputSchema: {
+            type: "object",
+            properties: {},
           },
         },
       ],
@@ -1454,6 +1308,30 @@ function createMcpServer(): Server {
         case "get_index_status":
           const status = getIndexStatus((args as { job_id: string }).job_id);
           result = status || { error: "Job not found" };
+          break;
+        case "watch_repo": {
+          const watchArgs = args as { repo_path: string; language?: string; use_llm_descriptions?: boolean };
+          const watchId = randomUUID();
+          result = startWatcher(
+            watchId,
+            watchArgs.repo_path,
+            watchArgs.language || "csharp",
+            "code_chunks",
+            qdrant,
+            neo4jDriver,
+            embeddingService,
+            config.ollamaUrl,
+            watchArgs.use_llm_descriptions || false
+          );
+          break;
+        }
+        case "stop_watcher": {
+          const stopArgs = args as { watch_id: string };
+          result = stopWatcher(stopArgs.watch_id);
+          break;
+        }
+        case "list_watchers":
+          result = listWatchers();
           break;
         default:
           throw new Error(`Unknown tool: ${name}`);
