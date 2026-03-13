@@ -497,6 +497,7 @@
                 <a href="#how-it-works">How It Works</a>
                 <a href="#tools">Tools</a>
                 <a href="#quickstart">Quick Start</a>
+                <a href="demo.html">Demo Script</a>
                 <a href="https://github.com/Applaud-Technologies/codebase-brain">GitHub</a>
             </div>
         </div>
@@ -548,9 +549,11 @@
                         <div class="terminal-body">
                             <p><span class="prompt">You:</span> Add email validation</p>
                             <p><span class="prompt">AI:</span> <span class="highlight">Searching existing code...</span></p>
-                            <p style="margin-top: 12px;"><span class="output">Found:</span> <span class="good">EmailValidator.IsValid()</span></p>
-                            <p><span class="output">Match:</span> <span class="good">95% similar</span></p>
-                            <p><span class="prompt">AI:</span> Recommend reusing existing method</p>
+                            <p style="margin-top: 12px;"><span class="output">Found:</span> <span class="good">EmailValidator.IsValid()</span> (85% similar)</p>
+                            <p style="margin-top: 12px;"><span class="highlight">How would you like to proceed?</span></p>
+                            <p><span class="good">1.</span> Reuse existing code</p>
+                            <p><span class="good">2.</span> Extend existing code</p>
+                            <p><span class="output">3.</span> Create new anyway</p>
                         </div>
                     </div>
                 </div>
@@ -610,11 +613,11 @@
                 </div>
                 <div class="tool-card">
                     <h3>detect_duplicates</h3>
-                    <p>Check if proposed code duplicates existing functionality before writing it.</p>
+                    <p>Check if proposed code duplicates existing functionality. With <code>ask_user_on_match</code>, prompts the developer to choose: reuse, extend, or create new.</p>
                 </div>
                 <div class="tool-card">
                     <h3>pre_write_guard</h3>
-                    <p>Blocks code generation unless search evidence is provided. The enforcement mechanism.</p>
+                    <p>Blocks code generation unless search evidence is provided. Returns interactive prompts when blocking, letting developers override with justification.</p>
                 </div>
             </div>
         </div>
@@ -644,8 +647,8 @@
 
             <div class="arch-features">
                 <div class="arch-feature">
-                    <h4>🧠 Semantic</h4>
-                    <p>Vector embeddings understand what code does, not just what it's named. Finds similar behavior across different naming conventions.</p>
+                    <h4>🧠 Dual-Vector Semantic</h4>
+                    <p>Two embeddings per symbol: one for descriptions, one for code. Matches both what code does and how it's written. Swappable models for future upgrades.</p>
                 </div>
                 <div class="arch-feature">
                     <h4>🔗 Structural</h4>
