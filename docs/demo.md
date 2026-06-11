@@ -4,7 +4,12 @@
 
 Ensure services are running:
 ```bash
+# MCP Gateway (port 3100)
 cd services/mcp-gateway && npm run dev
+
+# Roslyn Worker for C# analysis (port 5000)
+cd services/roslyn-worker && dotnet run
+
 # Qdrant, Neo4j should be up via docker-compose
 ```
 
@@ -109,6 +114,40 @@ Customers get 1 point per dollar spent, with a 2x multiplier for orders over $10
 ### 6. The Payoff (30 sec)
 
 > "Without Codebase Brain, we'd now have 4 email validators and 3 shipping calculators. With it, Claude found what existed, asked what to do, and only wrote genuinely new code."
+
+---
+
+---
+
+### 7. Cross-Stack Analysis (1-2 min)
+
+Run the multi-analyzer to find unused code and duplicates:
+
+```bash
+# Start analysis
+curl -s -X POST localhost:3100/api/tools/analyze_repository \
+  -H "Content-Type: application/json" \
+  -d '{"repository_path": "/path/to/test/sample-repo", "analyzers": ["roslyn", "jscpd"]}' | jq
+```
+
+**What happens:**
+- Discovers .sln/.csproj files for Roslyn, package.json for JS/TS tools
+- Runs analyzers in parallel with individual timeouts
+- Stores results in `.codebase-brain/runs/{job_id}/`
+- Generates markdown report grouped by concern
+
+Fetch results:
+```bash
+curl -s -X POST localhost:3100/api/tools/get_analysis_result \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "job_xxx", "repository_path": "/path/to/repo"}' | jq
+```
+
+**Expected findings in sample-repo:**
+- `LegacyNormalize` - unused private method in `StringExtensions.cs:38`
+- Duplicate code block in `ShippingService.cs:21` (matches line 38)
+
+**Key point:** "Analysis runs async and integrates with pre_write_guard to warn about existing issues before new code is written."
 
 ---
 
