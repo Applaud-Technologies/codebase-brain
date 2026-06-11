@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 namespace SampleApp.Extensions;
 
 /// <summary>
@@ -30,5 +32,11 @@ public static class StringExtensions
             return string.Empty;
 
         return Regex.Replace(text.ToLower(), @"[^a-z0-9]+", "-").Trim('-');
+    }
+
+    // UNUSED: This method is never called - for testing unused code detection
+    private static string LegacyNormalize(string input)
+    {
+        return input?.Trim().ToLowerInvariant() ?? string.Empty;
     }
 }

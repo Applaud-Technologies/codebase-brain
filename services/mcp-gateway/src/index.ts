@@ -21,6 +21,18 @@ import {
   listWatchers,
   getSupportedLanguages,
 } from "./indexer.js";
+import {
+  analyzeRepository,
+  getAnalysisResult,
+  listAnalysisRuns,
+  cleanupAnalysisRuns,
+} from "./analyzer.js";
+import type {
+  AnalyzeRepositoryInput,
+  GetAnalysisResultInput,
+  ListAnalysisRunsInput,
+  CleanupAnalysisRunsInput,
+} from "./analyzer-types.js";
 
 // =============================================================================
 // CONFIGURATION
@@ -539,15 +551,79 @@ async function preWriteGuard(params: {
   };
   justification: string;
   ask_user_on_block?: boolean;
+  analyzer_job_id?: string;
+  repository_path?: string;
 }) {
   const missingSteps: string[] = [];
   const concerns: string[] = [];
+  const analyzerWarnings: string[] = [];
   const suggestions: Array<{ action: string; target_symbol?: string; rationale: string }> =
     [];
   const askUserOnBlock = params.ask_user_on_block ?? true; // Default to true for interactive mode
 
   // Track duplicate info for user prompt
   let duplicateInfo: { name: string; file_path: string; similarity: number; symbol_id: string } | null = null;
+
+  // Check analyzer findings if job_id provided (warning mode only per MVP)
+  if (params.analyzer_job_id && params.repository_path) {
+    try {
+      const analysisResult = await getAnalysisResult({
+        job_id: params.analyzer_job_id,
+        repository_path: params.repository_path,
+        include_findings: true,
+        include_markdown: false,
+      });
+
+      if (analysisResult.job?.findings && params.proposed_change.file_path) {
+        const targetPath = params.proposed_change.file_path;
+        const relevantFindings = analysisResult.job.findings.filter((f) => {
+          // Check if finding is in the same file or nearby
+          if (f.location.file_path === targetPath) return true;
+          // Check if finding mentions a symbol we might be duplicating
+          if (f.rule_id.includes("duplicate") && f.summary.toLowerCase().includes(params.proposed_change.name.toLowerCase())) return true;
+          return false;
+        });
+
+        for (const finding of relevantFindings) {
+          if (finding.rule_id.includes("duplicate")) {
+            analyzerWarnings.push(
+              `⚠️ Duplicate code detected: ${finding.title} at ${finding.location.file_path}:${finding.location.start_line}`
+            );
+            suggestions.push({
+              action: "refactor_candidate",
+              target_symbol: finding.location.symbol,
+              rationale: finding.recommendation.rationale,
+            });
+          } else if (finding.rule_id.includes("complexity") || finding.rule_id.includes("high_complexity")) {
+            analyzerWarnings.push(
+              `⚠️ High complexity: ${finding.title} - adding code here may increase maintenance burden`
+            );
+            suggestions.push({
+              action: "reduce_complexity",
+              target_symbol: finding.location.symbol,
+              rationale: "Consider simplifying before adding more code",
+            });
+          } else if (finding.rule_id.includes("unused")) {
+            analyzerWarnings.push(
+              `ℹ️ Unused code nearby: ${finding.title} - consider cleaning up before adding new code`
+            );
+          }
+        }
+
+        // Check for high-impact symbols near the target
+        const highImpactFindings = analysisResult.job.findings.filter(
+          (f) => f.rule_id.includes("high_impact") && f.location.file_path === targetPath
+        );
+        if (highImpactFindings.length > 0) {
+          analyzerWarnings.push(
+            `⚠️ Modifying high-impact area: ${highImpactFindings[0].title} - changes here may affect many callers`
+          );
+        }
+      }
+    } catch {
+      // Silently ignore analyzer errors - they shouldn't block the guard
+    }
+  }
 
   // Check required searches
   if (!params.search_evidence.behavior_search_performed) {
@@ -628,11 +704,13 @@ async function preWriteGuard(params: {
     verdict,
     missing_steps: missingSteps,
     concerns,
+    analyzer_warnings: analyzerWarnings.length > 0 ? analyzerWarnings : undefined,
     suggestions,
     audit_record: {
       timestamp: new Date().toISOString(),
       proposed_change: params.proposed_change,
       evidence_provided: params.search_evidence,
+      analyzer_job_id: params.analyzer_job_id,
       verdict,
     },
   };
@@ -938,7 +1016,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "pre_write_guard",
-        description: "REQUIRED before creating new code. Validates search evidence and justification. Returns user_prompt when blocked.",
+        description: "REQUIRED before creating new code. Validates search evidence, justification, and optionally checks analyzer findings for warnings.",
         inputSchema: {
           type: "object",
           properties: {
@@ -965,6 +1043,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             ask_user_on_block: { type: "boolean", default: true, description: "If true (default), returns user_prompt with options when blocked" },
             justification: { type: "string" },
+            analyzer_job_id: { type: "string", description: "Optional: job_id from analyze_repository to check for warnings" },
+            repository_path: { type: "string", description: "Required if analyzer_job_id is provided" },
           },
           required: ["proposed_change", "search_evidence", "justification"],
         },
@@ -978,6 +1058,68 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             file_path: { type: "string" },
             namespace: { type: "string" },
           },
+        },
+      },
+      {
+        name: "analyze_repository",
+        description: "Start code analysis and return a job handle immediately. Use get_analysis_result to retrieve findings.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repository_path: { type: "string", description: "Path to the repository to analyze" },
+            languages: { type: "array", items: { type: "string" }, description: "Filter by languages (csharp, typescript, javascript)" },
+            include_tests: { type: "boolean", default: false },
+            changed_files_only: { type: "boolean", default: false },
+            severity_threshold: { type: "string", enum: ["info", "warning", "error"] },
+            analyzers: { type: "array", items: { type: "string" }, description: "Specific analyzers to run (roslyn, jscpd, fallow)" },
+            force_refresh: { type: "boolean", default: false },
+          },
+          required: ["repository_path"],
+        },
+      },
+      {
+        name: "get_analysis_result",
+        description: "Retrieve status, partial, or final findings for an analysis job.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            job_id: { type: "string" },
+            repository_path: { type: "string", description: "Path to the repository (where the job was run)" },
+            include_markdown: { type: "boolean", default: true },
+            include_findings: { type: "boolean", default: true },
+            stage_filter: { type: "string", enum: ["discovery", "roslyn", "jscpd", "fallow", "report"] },
+          },
+          required: ["job_id"],
+        },
+      },
+      {
+        name: "list_analysis_runs",
+        description: "List local run artifacts for a repository.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repository_path: { type: "string" },
+            status_filter: { type: "string", enum: ["queued", "running", "finalizing", "completed", "failed", "timeout"] },
+            include_pinned: { type: "boolean", default: true },
+            limit: { type: "integer", default: 25 },
+          },
+          required: ["repository_path"],
+        },
+      },
+      {
+        name: "cleanup_analysis_runs",
+        description: "Delete old local analysis artifacts according to retention policy.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            repository_path: { type: "string" },
+            dry_run: { type: "boolean", default: true },
+            older_than_days: { type: "integer" },
+            keep_latest: { type: "integer", default: 25 },
+            include_failed: { type: "boolean", default: true },
+            delete_unpinned_only: { type: "boolean", default: true },
+          },
+          required: ["repository_path"],
         },
       },
     ],
@@ -1009,6 +1151,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case "get_architecture_context":
         result = await getArchitectureContext(args as Parameters<typeof getArchitectureContext>[0]);
+        break;
+      case "analyze_repository":
+        result = await analyzeRepository(args as AnalyzeRepositoryInput);
+        break;
+      case "get_analysis_result":
+        result = await getAnalysisResult(args as GetAnalysisResultInput);
+        break;
+      case "list_analysis_runs":
+        result = await listAnalysisRuns(args as ListAnalysisRunsInput);
+        break;
+      case "cleanup_analysis_runs":
+        result = await cleanupAnalysisRuns(args as CleanupAnalysisRunsInput);
         break;
       default:
         throw new Error(`Unknown tool: ${name}`);
@@ -1093,6 +1247,42 @@ app.post("/api/tools/pre_write_guard", async (req: Request, res: Response) => {
 app.post("/api/tools/get_architecture_context", async (req: Request, res: Response) => {
   try {
     const result = await getArchitectureContext(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+app.post("/api/tools/analyze_repository", async (req: Request, res: Response) => {
+  try {
+    const result = await analyzeRepository(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+app.post("/api/tools/get_analysis_result", async (req: Request, res: Response) => {
+  try {
+    const result = await getAnalysisResult(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+app.post("/api/tools/list_analysis_runs", async (req: Request, res: Response) => {
+  try {
+    const result = await listAnalysisRuns(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+app.post("/api/tools/cleanup_analysis_runs", async (req: Request, res: Response) => {
+  try {
+    const result = await cleanupAnalysisRuns(req.body);
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: (error as Error).message });

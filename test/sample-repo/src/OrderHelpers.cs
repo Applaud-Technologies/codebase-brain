@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 namespace SampleApp.Helpers;
 
 /// <summary>
@@ -46,5 +48,14 @@ public static class OrderHelpers
         };
 
         return Math.Round(subtotal * taxRate, 2);
+    }
+
+    public static int CalculateLoyaltyPoints(decimal orderTotal)
+    {
+        if (orderTotal <= 0)
+            return 0;
+
+        var multiplier = orderTotal > 100 ? 2 : 1;
+        return (int)(orderTotal * multiplier);
     }
 }

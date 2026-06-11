@@ -6,6 +6,8 @@ node_modules/
 dist/
 build/
 *.js.map
+bin/
+obj/
 
 # Environment
 .env
@@ -26,6 +28,9 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Codebase Brain local analysis artifacts
+**/.codebase-brain/runs/
 
 # Docker volumes (local data)
 data/

@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 namespace SampleApp.Validation;
 
 /// <summary>
@@ -31,6 +33,7 @@ public static class EmailValidator
             return false;
 
         var domain = email.Split('@')[1];
-        return await DnsHelper.HasMxRecord(domain);
+        await Task.Delay(1);
+        return !string.IsNullOrEmpty(domain);
     }
 }
