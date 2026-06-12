@@ -83,17 +83,19 @@ async function initClients() {
 // =============================================================================
 
 async function findExistingBehavior(params: {
-  description: string;
+  description?: string;
+  task_description?: string;  // Alias for description
   language: string;
   namespace?: string;
   symbol_type?: string;
   limit?: number;
 }) {
+  const description = params.description || params.task_description || "";
   const limit = Math.floor(params.limit || 10);  // Ensure integer for Qdrant
   const startTime = Date.now();
 
   // Generate embedding for the description (used for both vector searches)
-  const embedding = await embeddingService.embed(params.description, "description");
+  const embedding = await embeddingService.embed(description, "description");
 
   // Build filter
   const filter = {
@@ -202,7 +204,7 @@ async function findSymbols(params: {
   include_references?: boolean;
   limit?: number;
 }) {
-  const limit = Math.floor(params.limit || 20);  // Ensure integer for Neo4j LIMIT
+  const limit = neo4j.int(Math.floor(params.limit || 20));  // Use Neo4j integer type
   const session = neo4jDriver.session();
 
   try {
@@ -961,12 +963,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             description: { type: "string", description: "Natural language description of the behavior" },
+            task_description: { type: "string", description: "Alias for description" },
             language: { type: "string", enum: ["csharp", "typescript", "javascript", "python", "go", "java"] },
             namespace: { type: "string", description: "Optional namespace filter" },
             symbol_type: { type: "string", enum: ["method", "class", "interface", "any"], default: "any" },
             limit: { type: "integer", default: 10 },
           },
-          required: ["description", "language"],
+          required: ["language"],
         },
       },
       {
@@ -1363,11 +1366,12 @@ function createMcpServer(): Server {
             type: "object",
             properties: {
               description: { type: "string", description: "Natural language description" },
+              task_description: { type: "string", description: "Alias for description" },
               language: { type: "string", enum: ["csharp", "typescript", "javascript", "python"] },
               namespace: { type: "string" },
               limit: { type: "integer", default: 10 },
             },
-            required: ["description", "language"],
+            required: ["language"],
           },
         },
         {
